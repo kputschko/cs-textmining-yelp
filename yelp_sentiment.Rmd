@@ -1,0 +1,452 @@
+---
+title: "Yelp Airlines - Sentiment Analysis"
+author: "Kevin Putschko"
+date: "November 19, 2018"
+output: 
+  html_document: 
+    df_print: kable
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse, tidytext, 
+               listviewer, jsonlite, 
+               janitor, lubridate,
+               ggridges, glmnet,
+               ggrepel, scales)
+
+yelp_airlines <- 
+  read_rds("data/yelp_airline.rds")
+
+yelp_words <- 
+  yelp_airlines %>% 
+  unnest_tokens(word, text)
+
+yelp_summary <-
+  yelp_airlines %>%
+  summarise(date_min = min(date),
+            date_max = max(date),
+            review_n = n_distinct(review_id),
+            business_n = n_distinct(business_name),
+            char_avg = str_length(text) %>% mean(),
+            star_avg = mean(stars)) %>% 
+  add_column(word_med = yelp_words %>% count(review_id) %>% pull(n) %>% median()) %>% 
+  mutate_at("review_n", comma) %>% 
+  mutate_at(c("char_avg", "star_avg", "word_med"), number_format(accuracy = 0.01))
+
+
+```
+
+## Introduction
+
+Suppose we are in the business of airline customer satisfaction.  There are many ways we could gauge consumer opinion, from Yelp, Google, or Facebook reviews to Twitter, questionnaires, or email.  In some cases we will have an objective measure of consumer satisfaction, as in the Yelp Star Rating, while in others there is only subjective text available.  Ideally, we wouldn't be limited to gauging sentiment via a numeric rating like Yelp alone.  With this article we hope to build a prediction model that can be applied to text-based consumer opinion regardless of platform.
+
+For this analysis we are going to use publicly available data from **Yelp** and **Twitter**.  This allows us to build a predictive model using customer opinion and rating from *Yelp* and test the model on text-only opinions from *Twitter*.
+
+The *Yelp* data comes from Kaggle, and we have filtered it to contain `r yelp_summary$review_n[[1]]` reviews from `r yelp_summary$business_n[[1]]` different airlines between the dates of `r yelp_summary$date_min` and `r yelp_summary$date_max`.  The median length of a review is `r yelp_summary$word_med[[1]]` words, with an average of `r yelp_summary$char_avg[[1]]` characters.  The average star rating is `r yelp_summary$star_avg[[1]]`.
+
+## A Simple Analysis
+
+We are using R and the package *tidytext* to help us with this exercise.  
+
+We begin with simple counts of words by *Yelp* star rating. 
+
+We see that the following plot tracks closely with our intuition about what a high rating review will look like.  On the right, we see words like "enjoyable", "excellent", and "seamless".  While on the left, the lower star reviews contain words like "difficult", "expensive", and "wtf".
+
+```{r Word Freq Plot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+yelp_words %>% 
+  anti_join(stop_words) %>% 
+  count(business_name, review_id, stars, word) %>%
+  group_by(word) %>%
+  summarise(businesses = n_distinct(business_name),
+            reviews = n(),
+            uses = sum(n),
+            average_stars = mean(stars)) %>%
+  mutate(round = scales::number(average_stars, accuracy = 0.50)) %>%
+  group_by(round) %>%
+  top_n(5, average_stars) %>%
+  top_n(5, businesses) %>%
+  top_n(5, reviews) %>% 
+  top_n(5, uses) %>% 
+
+  ggplot() +
+  aes(x = average_stars, y = uses, label = word) +
+  geom_label(position = position_jitter(width = 0.40, height = 0.80, seed = 42),
+             size = 3,
+             alpha = 0.50,
+             fill = "lightgray") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(x = "Average Stars",
+       y = "log(Frequency)",
+       title = "Yelp Review Word Frequency")
+
+```
+
+## Ratings
+
+Because we are working with word counts, the fact that there are many more 1* reviews than any other is likely to influence how some words show up more negative than they might actually be.  
+
+```{r Ratings, echo=FALSE}
+yelp_airlines %>%
+  count(stars) %>%
+  ggplot() +
+  aes(x = stars, y = n, label = n, fill = stars) +
+  geom_col() +
+  geom_text(nudge_y = 50) +
+  scale_fill_viridis_c(guide = FALSE) +
+  theme_minimal() +
+  scale_y_continuous(breaks = NULL, labels = NULL) +
+  labs(x = NULL, y = NULL, title = "Yelp Airline Ratings", subtitle = "A majority of reviews are 1*")
+```
+
+
+
+Next, we'll take a look at how the ratings have changed over time.  We can see that the average review score steadily decreased between early 2013 and mid 2014.  We also notice that the number of monthly reviews increased in this same time period, as represented by the size of the point.  
+
+```{r Rating Over Time, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+yelp_airlines %>%
+  mutate(month = lubridate::floor_date(date, unit = "month")) %>%
+  group_by(month) %>%
+  summarise(businesses = n_distinct(business_name),
+            reviews = n_distinct(review_id),
+            avg_stars = mean(stars)) %>%
+  ggplot() +
+  aes(x = month, y = avg_stars, size = reviews, fill = avg_stars) +
+  geom_smooth(se = FALSE, span = .6, color = "black") +
+  geom_vline(xintercept = as_date("2013-01-01"), color = "red", linetype = "dashed") +
+  geom_point(alpha = 0.80, color = "black", shape = 21) +
+  scale_fill_viridis_c(guide = FALSE) +
+  theme_minimal() +
+  labs(x = NULL, y = NULL,
+       color = "Star Rating",
+       title = "Yelp Ratings Over Time",
+       subtitle = "Average monthly star rating decreased after 2013",
+       caption = "Size: Number of Monthly Reviews") +
+  guides(size = "none") +
+  scale_y_continuous(breaks = 1:5, minor_breaks = NULL)
+```
+
+
+## Sentiment Analysis
+
+Now we will delve into the heart of the sentiment analysis, but first we have to identify a sentiment lexicon that fits our use case.  There are plenty of lexicons available for public use, but it can be an arduous task to find one that uniquely matches our intuition of consumer opinion ratings.
+
+#### Pre-Defined Sentiment Lexicon
+
+Let's test out the sentiment lexicon developed by Hu & Liu and used by both **Bing** and **Google** [*](https://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html). This lexicon classifies nearly 7,000 words as either "*positive*" or "*negative*".
+
+We can apply these labels to the words in each review, and get a feel for the labeled sentiment of each review.  
+
+```{r Bing Lexicon, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+lexicon <- get_sentiments(lexicon = "bing")
+
+yelp_bing_sentiment <- 
+  yelp_words %>% 
+  left_join(lexicon, by = "word") %>%
+  group_by(date, review_id) %>%
+  count(sentiment) %>%
+  mutate(percent_review = n / sum(n))
+
+yelp_bing_sentiment %>% 
+  group_by(date) %>%
+  mutate(percent_review_daily  = n / sum(n)) %>%
+  group_by(date, sentiment) %>%
+  summarise(percent_daily = sum(percent_review_daily)) %>%
+  mutate(percent_daily = if_else(sentiment == "negative", -percent_daily, percent_daily)) %>%
+  filter(!is.na(sentiment)) %>%
+  ggplot() +
+  aes(x = date, y = percent_daily, fill = str_to_title(sentiment)) +
+  geom_col() +
+  geom_hline(yintercept = 0, color = "black") +
+  theme_minimal() +
+  labs(x = NULL, y = NULL,
+       title = "Proportion of Daily Sentiment",
+       subtitle = "Negative sentiment becomes a bit more dense after 2013",
+       fill = "Sentiment") +
+  scale_y_continuous(limits = c(-0.50, 0.50))
+
+```
+
+But how do we know these sentiment labels accurately capture consumer sentiment?  In the sentiment plot shown above, we don't see the connection between negative word sentiment, and the decrease in average ratings over time that we saw earlier.  
+
+In the following plot, we gauge the relation between the *Hu & Liu* sentiment labels and the *Yelp* consumer rating.  We see that the negative label does indeed capture the lower Yelp scores, but the positive label does not capture the higher Yelp scores very well.  
+
+```{r Guage Bing Sentiment, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+  yelp_bing_sentiment %>%
+  left_join(yelp_airlines %>% select(review_id, stars)) %>%
+  filter(!is.na(sentiment)) %>%
+  group_by(date, review_id) %>%
+  filter(percent_review == max(percent_review)) %>%
+  ggplot() +
+  aes(x = stars, fill = str_to_title(sentiment)) +
+  geom_density(alpha = 0.50) +
+  scale_y_continuous(breaks = NULL) +
+  theme_minimal() +
+  labs(y = NULL,
+       x = "Review Stars",
+       fill = "Sentiment Label",
+       title = "Can We Trust the Sentiment Labels?",
+       subtitle = "Negative sentiment appears to capture lower star reviews as expected,\nhowever positive sentiment is spread across all stars uniformly.")
+
+```
+
+
+#### Customized Sentiment Lexicon
+
+```{r GLMNet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+if ("temp_nlp_model.rds" %in% dir("data")) {
+  
+  model_prediction <- read_rds("data/temp_nlp_model.rds")
+  
+} else {
+  
+  data_matrix <- 
+    yelp_words %>% 
+    count(review_id, word) %>% 
+    cast_dtm(document = review_id, 
+             term = word,
+             value = n) %>% 
+    as.matrix()
+  
+  data_response <- 
+    yelp_airlines %>% 
+    arrange(review_id) %>% 
+    pull(stars)
+  
+  model_lasso <- glmnet(x = data_matrix, y = data_response, family = "gaussian", alpha = 1)
+  model_lasso_cv <- cv.glmnet(x = data_matrix, y = data_response, family = "gaussian", alpha = 1, type.measure = "mse")
+  
+  model_lambda <- model_lasso_cv$lambda.min
+  
+  model_predict <- predict(model_lasso, data_matrix, s = model_lambda)
+  model_predict_coef <- predict(model_lasso, data_matrix, s = model_lambda, type = "coefficient")
+  
+  model_predict_review <-
+    model_predict %>%
+    as.data.frame() %>%
+    rownames_to_column("review_id") %>%
+    as_tibble() %>%
+    rename(score = `1`)
+  
+  
+  model_predict_word <-
+    model_predict_coef %>%
+    as.matrix() %>%
+    as.data.frame() %>%
+    rownames_to_column("word") %>%
+    as_tibble() %>%
+    rename(score = `1`) %>%
+    mutate(sentiment = case_when(
+      score < 0 ~ "Negative",
+      score > 0 ~ "Positive",
+      TRUE ~ "Neutral"
+    )) 
+  
+  model_prediction <- 
+    lst(model_predict_review,
+        model_predict_word,
+        model_lasso,
+        model_lambda)
+  
+  write_rds(model_prediction, "data/temp_nlp_model.rds")
+  
+}
+```
+
+One solution to this problem is to create our own sentiment scores.  We have all the necessary information for a machine learning prediction model.  The Yelp data has the raw text and an objective numeric rating indicating the consumer's opinion.  
+
+There is a lot of work going on in the background here, but basically we are building a generalized linear model using the frequency of each word as input and the Yelp star rating as the output.  This, in effect, allows us to start each review with a baseline rating and add or subtract points based on the words that show up in the review.  
+
+With our newly created machine learning model, we demonstrate the predicted versus actual scores for each review.  
+
+```{r Predicted v Actual, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+model_prediction$model_predict_review %>% 
+  left_join(yelp_airlines %>% select(review_id, stars)) %>%
+  mutate(residual = score - stars) %>%
+  arrange(residual) %>%
+  ggplot() +
+  aes(x = score, y = factor(stars), fill = factor(stars)) +
+  ggridges::geom_density_ridges() +
+  scale_fill_viridis_d(guide = FALSE) +
+  scale_x_continuous(breaks = 0:6, limits = c(0, 6)) +
+  theme_minimal() +
+  labs(x = "Predicted", y = "Actual", 
+       title = "Ratings Based on Machine Learning",
+       subtitle = "We see the low score skew, with high actual ratings being predicted as ~3*\nand low ratings predicted around ~2*")
+```
+
+The density plot above indicates our model is not too far off base.  We do note that the predictions tend to hover around the middle, with actual 2\*-4\* being predicted to be quite close to each other.  This just means our model might not perform very well with middle scores.    
+
+However, the plot below shows us the model does indeed address the issue we saw with the *Hu & Liu* sentiment labels.  Our customized scores do a better job of distinguishing between the positive and negative consumer opinions than the established sentiment lexicon. 
+
+```{r Capture Area, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+yelp_words %>% 
+  left_join(model_prediction$model_predict_word) %>% 
+  filter(word != "(Intercept)") %>% 
+  group_by(date, review_id, stars) %>%
+  count(sentiment) %>%
+  mutate(percent_review = n / sum(n)) %>% 
+  filter(sentiment != "Neutral") %>%
+  group_by(date, review_id, stars) %>%
+  filter(percent_review == max(percent_review)) %>%
+  ggplot() +
+  aes(x = stars, fill = sentiment) +
+  geom_density(alpha = 0.50) +
+  # scale_y_continuous(breaks = NULL) +
+  theme_minimal() +
+  labs(y = "Proportion of Reviews",
+       x = "Actual Stars",
+       fill = "Predicted\nSentiment",
+       title = "Can We Trust the Sentiment Labels?",
+       subtitle = "Our sentiment scores do a better job distinguishing\nbetween positive and negative reviews.")
+```
+
+###### Influential Words
+
+Now that we've established our custom sentiment scores, let's take a look at the 20 most influential words in the Yelp data.  This lines up with our intuition of what negative and positive reviews might look like.  Interestingly, words like "nickel" show up as part of the phrase "nickel-and-dime"; along with the word "averaged" when consumers justify their rating as the aggregate of all their experiences with the airline.
+
+```{r Word Scores, echo=FALSE}
+model_prediction$model_predict_word %>% 
+  filter(sentiment != "Neutral",
+         word != "(Intercept)") %>%
+  group_by(sentiment) %>%
+  top_n(10, wt = abs(score)) %>%
+  arrange(score) %>%
+  ggplot() +
+  aes(x = as_factor(word), y = score, fill = sentiment) +
+  geom_col() +
+  coord_flip() +
+  labs(y = "Review Score Adjustment Based on Word", 
+       x = NULL, fill = NULL,
+       title = "Yelp Airline Opinion",
+       subtitle = "20 Most Influential Words") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(-1.25, 1.25))
+```
+
+For a larger view of the impact of certain words, let's take a look at the *chatterplot* below.  Words towards the top of the chart show up more often in the reviews, while those towards the right of the chart have a more positive connotation. We see words like "never", "again", and "rude" show up frequently with negative connotations, and words like "great", "friendly", "best" with positive connotations.  
+
+```{r Chatterplot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+inner_join(
+  x = model_prediction$model_predict_word %>% filter(sentiment != "Neutral", word != "(Intercept)"),
+  y = yelp_words %>% count(word, sort = TRUE),
+  by = "word") %>%
+  filter(n < 1000) %>%
+  top_n(100, n) %>%
+  ggplot() +
+  aes(x = score, y = n, color = score, label = word, size = n) +
+  geom_text_repel(segment.alpha = 0) +
+  scale_y_log10() +
+  scale_color_viridis_c(option = "A", end = 0.75, guide = "none") +
+  scale_size_continuous(range = c(2, 6),
+                        guide = FALSE) +
+  theme_minimal() +
+  labs(x = "Predicted Word Score", y = "Word Frequency")
+```
+
+## Twitter Opinion
+
+Now that we have demonstrated the ML model, lets apply it to some consumer airline opinions shared on Twitter.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+twitter <- 
+  read_rds("data/twitter_airline.rds") %>% 
+  mutate(date = tweet_created %>% anytime::anytime()) %>%
+  distinct(date, text) %>%
+  rownames_to_column("tweet_id")
+
+twitter_words <- 
+  twitter %>% 
+  unnest_tokens(word, text)
+
+twitter_summary <-
+  twitter %>%
+  summarise(date_min = min(date) %>% as.Date(),
+            date_max = max(date) %>% as.Date(),
+            tweets = length(text),
+            char_avg = str_length(text) %>% mean()) %>%
+  add_column(word_med = twitter_words %>% count(tweet_id) %>% pull(n) %>% median()) %>% 
+  mutate_at("tweets", comma) %>% 
+  mutate_at("char_avg", number_format(accuracy = 0.1)) %>% 
+  print()
+```
+
+
+First of all, we see that there are `r twitter_summary$tweets[[1]]` tweets between `r twitter_summary$date_min[[1]]` and `r twitter_summary$date_max[[1]]`. The average tweet has a median of `r twitter_summary$word_med[[1]]` words and an average of `r twitter_summary$char_avg[[1]]` characters.  
+
+This is quite different from the size of Yelp reviews we saw earlier.  
+
+When calculating the score of each tweet, we find that there are many 0 score tweets, which are essentially tweets composed of words that our prediction model did not account for.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+twitter_word_score <- 
+  twitter_words %>% 
+  left_join(model_prediction$model_predict_word)
+
+twitter_review_score <- 
+  twitter_word_score %>% 
+  group_by(tweet_id) %>% 
+  summarise(tweet_score = sum(score, na.rm = TRUE))
+
+twitter_review_score %>% 
+  ggplot() +
+  aes(x = tweet_score) +
+  # geom_histogram(bins = 60) +
+  geom_density_line() +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal()
+  
+```
+
+For example, looking at some 0 score tweets, we see many of these tweets are either questions or conversational, as users are more likely to engage in direct dialogue with the airline itself.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+twitter_review_score %>% 
+  filter(tweet_score == 0) %>% 
+  sample_n(3) %>% 
+  left_join(twitter)
+```
+
+So the solution here is simply to remove 0 score tweets, and continue our exploration.
+
+Now we can complete the prediction by converting these tweet scores to the "star rating" units used in the original Yelp prediction model.  In the plot below we see that a majority of the tweets are quite neutral, hovering near ~2.4 stars.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+model_intercept <- 
+  model_prediction$model_predict_word %>% 
+  filter(word == "(Intercept)") %>% 
+  pull(score)
+
+twitter_score_stars <- 
+  twitter_review_score %>% 
+  filter(tweet_score != 0) %>% 
+  mutate(stars_predicted = tweet_score + model_intercept,
+         sentiment = ifelse(tweet_score > 0, "positive", "negative"))
+
+twitter_score_stars %>% 
+  ggplot() + 
+  aes(x = stars_predicted) +
+  geom_density_line() +
+  theme_minimal() +
+  scale_x_continuous(breaks = 0:5, limits = c(0, 5)) +
+  labs(x = "Predicted Stars", y = "Density", title = "Twitter Sentiment Estimation")
+  
+```
+
+If we take a look at a few of the tweets with the highest and lowest scores, we can see that they do indeed match our intuition of what a consumer opinion would look like.   
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+twitter_score_stars %>% 
+  nest(-sentiment) %>% 
+  transmute(top_score = data %>%  map(~ .x %>% top_n(3, abs(tweet_score)))) %>% 
+  unnest(top_score) %>% 
+  arrange(stars_predicted) %>% 
+  left_join(twitter) %>% 
+  select(stars_predicted, text)
+```
+
+## Conclusion
+
+To summarise what we've covered here, we've learned that existing sentiment lexicons may not always meet our needs, and that we are able to create our own sentiment scores given the right data.  Yelp is a good tool for building a custom score set, however, as we saw when applied to Twitter comments, the Yelp predictions are based on the long-form opinions unique to Yelp, which may not translate perfectly to the wider variety in consumer communicaitons we find on Twitter.
