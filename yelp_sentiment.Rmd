@@ -54,7 +54,7 @@ We begin with simple counts of words by *Yelp* star rating.
 
 We see that the following plot tracks closely with our intuition about what a high rating review will look like.  On the right, we see words like "enjoyable", "excellent", and "seamless".  While on the left, the lower star reviews contain words like "difficult", "expensive", and "wtf".
 
-```{r Word Freq Plot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r WordFreq_Plot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 yelp_words %>% 
   anti_join(stop_words) %>% 
   count(business_name, review_id, stars, word) %>%
@@ -105,7 +105,7 @@ yelp_airlines %>%
 
 Next, we'll take a look at how the ratings have changed over time.  We can see that the average review score steadily decreased between early 2013 and mid 2014.  We also notice that the number of monthly reviews increased in this same time period, as represented by the size of the point.  
 
-```{r Rating Over Time, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r Rating_Time, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 yelp_airlines %>%
   mutate(month = lubridate::floor_date(date, unit = "month")) %>%
   group_by(month) %>%
@@ -139,7 +139,7 @@ Let's test out the sentiment lexicon developed by Hu & Liu and used by both **Bi
 
 We can apply these labels to the words in each review, and get a feel for the labeled sentiment of each review.  
 
-```{r Bing Lexicon, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r HuLiu_Lexicon, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 lexicon <- get_sentiments(lexicon = "bing")
 
 yelp_bing_sentiment <- 
@@ -173,7 +173,7 @@ But how do we know these sentiment labels accurately capture consumer sentiment?
 
 In the following plot, we gauge the relation between the *Hu & Liu* sentiment labels and the *Yelp* consumer rating.  We see that the negative label does indeed capture the lower Yelp scores, but the positive label does not capture the higher Yelp scores very well.  
 
-```{r Guage Bing Sentiment, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r Guage_Sentiment, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
   yelp_bing_sentiment %>%
   left_join(yelp_airlines %>% select(review_id, stars)) %>%
   filter(!is.na(sentiment)) %>%
@@ -262,7 +262,7 @@ There is a lot of work going on in the background here, but basically we are bui
 
 With our newly created machine learning model, we demonstrate the predicted versus actual scores for each review.  
 
-```{r Predicted v Actual, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r Predicted_Actual, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 model_prediction$model_predict_review %>% 
   left_join(yelp_airlines %>% select(review_id, stars)) %>%
   mutate(residual = score - stars) %>%
@@ -282,7 +282,7 @@ The density plot above indicates our model is not too far off base.  We do note 
 
 However, the plot below shows us the model does indeed address the issue we saw with the *Hu & Liu* sentiment labels.  Our customized scores do a better job of distinguishing between the positive and negative consumer opinions than the established sentiment lexicon. 
 
-```{r Capture Area, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r Capture_Area, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 yelp_words %>% 
   left_join(model_prediction$model_predict_word) %>% 
   filter(word != "(Intercept)") %>% 
@@ -308,7 +308,7 @@ yelp_words %>%
 
 Now that we've established our custom sentiment scores, let's take a look at the 20 most influential words in the Yelp data.  This lines up with our intuition of what negative and positive reviews might look like.  Interestingly, words like "nickel" show up as part of the phrase "nickel-and-dime"; along with the word "averaged" when consumers justify their rating as the aggregate of all their experiences with the airline.
 
-```{r Word Scores, echo=FALSE}
+```{r Word_Scores, echo=FALSE}
 model_prediction$model_predict_word %>% 
   filter(sentiment != "Neutral",
          word != "(Intercept)") %>%
@@ -351,7 +351,7 @@ inner_join(
 
 Now that we have demonstrated the ML model, lets apply it to some consumer airline opinions shared on Twitter.
 
-```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r twitter-setup, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
 twitter <- 
   read_rds("data/twitter_airline.rds") %>% 
   mutate(date = tweet_created %>% anytime::anytime()) %>%
@@ -370,8 +370,7 @@ twitter_summary <-
             char_avg = str_length(text) %>% mean()) %>%
   add_column(word_med = twitter_words %>% count(tweet_id) %>% pull(n) %>% median()) %>% 
   mutate_at("tweets", comma) %>% 
-  mutate_at("char_avg", number_format(accuracy = 0.1)) %>% 
-  print()
+  mutate_at("char_avg", number_format(accuracy = 0.1))
 ```
 
 
@@ -381,7 +380,7 @@ This is quite different from the size of Yelp reviews we saw earlier.
 
 When calculating the score of each tweet, we find that there are many 0 score tweets, which are essentially tweets composed of words that our prediction model did not account for.  
 
-```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+```{r twitter_score, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
 twitter_word_score <- 
   twitter_words %>% 
   left_join(model_prediction$model_predict_word)
@@ -414,7 +413,7 @@ So the solution here is simply to remove 0 score tweets, and continue our explor
 
 Now we can complete the prediction by converting these tweet scores to the "star rating" units used in the original Yelp prediction model.  In the plot below we see that a majority of the tweets are quite neutral, hovering near ~2.4 stars.  
 
-```{r echo=FALSE, message=FALSE, warning=FALSE}
+```{r twitter_stars, echo=FALSE, message=FALSE, warning=FALSE}
 model_intercept <- 
   model_prediction$model_predict_word %>% 
   filter(word == "(Intercept)") %>% 
